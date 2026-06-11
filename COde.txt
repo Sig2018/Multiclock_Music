@@ -1,0 +1,15 @@
+    case AUDIO_LOW:
+      // Icono verde — el nombre del array debe coincidir con el de tu Mute2.h
+      // Si da error, abrí Mute2.h y reemplazá "Mute2" por el nombre real del array
+      if (modoF1)
+        tft.pushImage(x, y, 20, 20, no_sound_30dp_EA3323_FILL1_wght700_GRAD0_opsz24VERDE);
+      else
+        tft.pushImage(x, y, 20, 20, MuteBocaVERDE);
+      break;
+    case AUDIO_MUTE:
+      // Icono rojo según modo
+      if (modoF1)
+        tft.pushImage(x, y, 20, 20, no_sound_30dp_EA3323_FILL1_wght700_GRAD0_opsz24);
+      else
+        tft.pushImage(x, y, 20, 20, MuteBoca);
+      break;

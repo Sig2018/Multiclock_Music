@@ -1,0 +1,11 @@
+build/
+.vscode/
+.git_multiclock20_backup/
+*.elf
+*.map
+
+secrets.h
+.env
+
+.DS_Store
+Thumbs.db
