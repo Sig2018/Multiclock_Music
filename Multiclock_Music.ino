@@ -205,6 +205,7 @@ void dibujarLogoF1(int x, int y, int ancho, int alto);
 void dibujarBandera(String countryCode, int x, int y, int ancho, int alto);
 void dibujarIconoMute(int x, int y, EstadoAudio estado);
 void reproducirChime();
+bool detenerAudio(uint32_t timeoutMs);
 void cargarCancionDelDia();
 void iniciarServidorSubida();
 void salirModoSubida();
@@ -234,6 +235,7 @@ SPIClass sdSPI(HSPI);
 volatile bool    enRampaInicio     = false;
 volatile bool    enRampaFin        = false;
 volatile uint8_t nivelRampa        = 0;
+volatile uint8_t ultimoNivelDAC    = 0;
 static uint8_t   audioBuffer[BUFFER_SIZE];
 static volatile int  bufHead       = 0;
 static volatile int  bufTail       = 0;
@@ -243,6 +245,8 @@ volatile bool        audioReproduciendo  = false;
 gptimer_handle_t audioTimer = NULL;
 TaskHandle_t audioTaskHandle = NULL;
 volatile bool    audioCancelar = false;
+volatile bool    audioParando  = false;
+const uint16_t   AUDIO_STOP_TIMEOUT_MS = 800;
 
 // Fade out
 volatile uint16_t volumenGlobal = 256;  // 256 = volumen completo, 0 = silencio
@@ -1512,12 +1516,7 @@ void mostrarPantallaModoSubida() {
 //  SERVIDOR WEB
 // ══════════════════════════════════════════════
 void iniciarServidorSubida() {
-  if (audioReproduciendo) {
-    audioTerminado = true; bufHead = bufTail; delay(20);
-    gptimer_stop(audioTimer); audioReproduciendo = false;
-    dac_output_voltage(DAC_CHAN_1, 0);
-    bufHead = 0; bufTail = 0;
-  }
+  detenerAudio(AUDIO_STOP_TIMEOUT_MS);
   modoSubida = true;
   mostrarPantallaModoSubida();
   Serial.println("[Web] Servidor iniciado en " + WiFi.localIP().toString());
@@ -1725,7 +1724,7 @@ void verificarOTA() {
 // ══════════════════════════════════════════════
 void audioTask(void* param) {
   File wav = SD.open(archivoActual.c_str());
-  if (!wav) { audioReproduciendo = false; vTaskDelete(NULL); return; }
+  if (!wav) { audioReproduciendo = false; audioParando = false; audioTaskHandle = NULL; vTaskDelete(NULL); return; }
 
   char chunkId[5]; chunkId[4] = 0;
   uint32_t chunkSize = 0, dataSize = 0;
@@ -1733,11 +1732,11 @@ void audioTask(void* param) {
   uint32_t sampleRate = 0;
 
   if (wav.read((uint8_t*)chunkId, 4) != 4 || strncmp(chunkId, "RIFF", 4) != 0) {
-    wav.close(); audioReproduciendo = false; vTaskDelete(NULL); return;
+    wav.close(); audioReproduciendo = false; audioParando = false; audioTaskHandle = NULL; vTaskDelete(NULL); return;
   }
   wav.seek(8);
   if (wav.read((uint8_t*)chunkId, 4) != 4 || strncmp(chunkId, "WAVE", 4) != 0) {
-    wav.close(); audioReproduciendo = false; vTaskDelete(NULL); return;
+    wav.close(); audioReproduciendo = false; audioParando = false; audioTaskHandle = NULL; vTaskDelete(NULL); return;
   }
 
   while (wav.available()) {
@@ -1760,7 +1759,7 @@ void audioTask(void* param) {
     if (chunkSize & 1) wav.seek(wav.position() + 1);
   }
 
-  if (dataSize == 0) { wav.close(); audioReproduciendo = false; vTaskDelete(NULL); return; }
+  if (dataSize == 0) { wav.close(); audioReproduciendo = false; audioParando = false; audioTaskHandle = NULL; vTaskDelete(NULL); return; }
 
   uint32_t bytesPorSegundo = sampleRate * numChannels * (bitsPerSample / 8);
   uint32_t bytesParaFade   = bytesPorSegundo * 4;  // Tiempo de Fadeout , fade en los últimos 4 segundos
@@ -1777,6 +1776,7 @@ void audioTask(void* param) {
   gptimer_set_alarm_action(audioTimer, &alarm_config);
 
   dac_output_voltage(DAC_CHAN_1, 0);
+  ultimoNivelDAC = 0;
   nivelRampa     = 0;
   enRampaInicio  = true;
   enRampaFin     = false;
@@ -1821,6 +1821,7 @@ static bool IRAM_ATTR onAudioTimer(gptimer_handle_t timer, const gptimer_alarm_e
 
   if (enRampaInicio) {
     dac_output_voltage(DAC_CHAN_1, nivelRampa);
+    ultimoNivelDAC = nivelRampa;
     if (nivelRampa < 128) nivelRampa++; else enRampaInicio = false;
     return true;
   }
@@ -1835,6 +1836,7 @@ static bool IRAM_ATTR onAudioTimer(gptimer_handle_t timer, const gptimer_alarm_e
         int16_t escalada = (centrada * volumenGlobal) >> 8;
         uint8_t volumen  = (uint8_t)(escalada + 128);
         dac_output_voltage(DAC_CHAN_1, volumen);
+        ultimoNivelDAC = volumen;
       }
     }
     if (audioTerminado && bufHead == bufTail) {
@@ -1845,10 +1847,12 @@ static bool IRAM_ATTR onAudioTimer(gptimer_handle_t timer, const gptimer_alarm_e
   }
 
   dac_output_voltage(DAC_CHAN_1, nivelRampa);
+  ultimoNivelDAC = nivelRampa;
   if (nivelRampa > 0) nivelRampa--;
   else {
     gptimer_stop(timer);
     audioReproduciendo = false;
+    audioParando = false;
     enRampaFin    = false;
     volumenGlobal = 256;  // restaurar para la próxima reproducción
   }
@@ -1873,6 +1877,59 @@ void initAudio() {
   gptimer_enable(audioTimer);
   Serial.println("[Audio] Listo");
   slog_info("Audio: Sistema de audio inicializado");
+}
+
+bool detenerAudio(uint32_t timeoutMs) {
+  if (!audioReproduciendo && audioTaskHandle == NULL) {
+    audioCancelar = false;
+    audioParando = false;
+    dac_output_voltage(DAC_CHAN_1, 0);
+    ultimoNivelDAC = 0;
+    return true;
+  }
+
+  audioParando = true;
+  audioCancelar = true;
+
+  unsigned long t0 = millis();
+  while (audioTaskHandle != NULL && millis() - t0 < timeoutMs) {
+    delay(5);
+  }
+
+  if (audioTaskHandle != NULL) {
+    Serial.println("[Audio] No se pudo detener la tarea de audio a tiempo");
+    slog_warning("Audio: timeout deteniendo tarea de audio");
+    return false;
+  }
+
+  bufHead = 0;
+  bufTail = 0;
+  enRampaInicio = false;
+  enRampaFin = true;
+  audioTerminado = true;
+  nivelRampa = ultimoNivelDAC;
+
+  t0 = millis();
+  while (audioReproduciendo && millis() - t0 < timeoutMs) {
+    delay(5);
+  }
+
+  if (audioReproduciendo) {
+    esp_err_t err = gptimer_stop(audioTimer);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+      Serial.printf("[Audio] gptimer_stop fallo: %d\n", err);
+    }
+    dac_output_voltage(DAC_CHAN_1, 0);
+    ultimoNivelDAC = 0;
+    audioReproduciendo = false;
+    enRampaFin = false;
+  }
+
+  audioCancelar = false;
+  audioTerminado = false;
+  volumenGlobal = 256;
+  audioParando = false;
+  return true;
 }
 
 void cargarListaWAV() {
@@ -1926,6 +1983,8 @@ void cargarListaWAV() {
 
 void reproducirChime() {
   if (audioReproduciendo) return;
+  if (audioTaskHandle != NULL) return;
+  if (audioParando) return;
   if (estadoAudio == AUDIO_MUTE) return;
 
   struct tm ti;
@@ -1986,7 +2045,17 @@ void reproducirChime() {
   audioCancelar  = false;
   volumenGlobal  = 256;  // siempre arrancar con volumen completo
 
-  xTaskCreatePinnedToCore(audioTask, "audioTask", 4096, NULL, 1, &audioTaskHandle, 0);
+  BaseType_t creada = xTaskCreatePinnedToCore(audioTask, "audioTask", 4096, NULL, 1, &audioTaskHandle, 0);
+  if (creada != pdPASS) {
+    Serial.println("[Audio] Error creando audioTask");
+    slog_error("Audio: error creando audioTask");
+    audioTaskHandle = NULL;
+    audioReproduciendo = false;
+    audioCancelar = false;
+    audioTerminado = false;
+    dac_output_voltage(DAC_CHAN_1, 0);
+    ultimoNivelDAC = 0;
+  }
 }
 
 // Función para generar envolvente pseudoaleatoria suave
@@ -2417,36 +2486,19 @@ void loop() {
       } else {
         if (duracion < 1000 && millis() - ultimoTouch > 300) {
           ultimoTouch = millis();
+          bool habiaAudioActivo = (audioReproduciendo || audioTaskHandle != NULL || audioParando);
+          EstadoAudio estadoAnterior = estadoAudio;
           if (estadoAudio == AUDIO_MUTE)     estadoAudio = AUDIO_LOW;
           else if (estadoAudio == AUDIO_LOW) estadoAudio = AUDIO_NORMAL;
           else                               estadoAudio = AUDIO_MUTE;
           audioMuteado = (estadoAudio == AUDIO_MUTE);
-          if (audioReproduciendo) {
-              audioCancelar = true;
-              // Esperar que audioTask cierre el archivo y termine — máximo 500ms
-              unsigned long t0 = millis();
-              while (audioReproduciendo && millis() - t0 < 500) {
-                  delay(10);
-              }
-              // Si no terminó solo, forzar
-              if (audioReproduciendo) {
-                  if (gptimer_stop(audioTimer) != ESP_OK) {
-                      Serial.println("[Audio] Timer ya detenido");
-                  }
-                  audioReproduciendo = false;
-              }
-              audioCancelar  = false;
-              audioTerminado = false;
-              enRampaInicio  = false;
-              enRampaFin     = false;
-              audioTaskHandle = NULL;
-              volumenGlobal  = 256;
-              dac_output_voltage(DAC_CHAN_1, 0);
-              bufHead = 0;
-              bufTail = 0;
+          if (habiaAudioActivo && estadoAudio == AUDIO_MUTE && !detenerAudio(AUDIO_STOP_TIMEOUT_MS)) {
+              Serial.println("[Audio] Toggle aplicado, esperando que termine la tarea anterior antes de reproducir otro audio");
           }
           Serial.printf("[Audio] Toggle → estado=%d (0=NORMAL 1=LOW 2=MUTE)\n", (int)estadoAudio);
-          if (estadoAudio != AUDIO_MUTE) reproducirChime();
+          if (estadoAnterior == AUDIO_MUTE && estadoAudio == AUDIO_LOW && !audioReproduciendo && audioTaskHandle == NULL && !audioParando) {
+            reproducirChime();
+          }
         }
       }
     }
