@@ -960,6 +960,7 @@ void dibujarBandera(String countryCode, int x, int y, int ancho, int alto) {
     if (f) {
       uint16_t anchoReal;
       f.read((uint8_t*)&anchoReal, 2);
+      if (anchoReal == 0 || anchoReal > 200) { f.close(); return; }
       uint16_t lineBuffer[200];
       for (int row = 0; row < alto; row++) {
         f.read((uint8_t*)lineBuffer, anchoReal * 2);
@@ -1902,12 +1903,14 @@ bool detenerAudio(uint32_t timeoutMs) {
     return false;
   }
 
+  gptimer_stop(audioTimer);
   bufHead = 0;
   bufTail = 0;
   enRampaInicio = false;
   enRampaFin = true;
   audioTerminado = true;
   nivelRampa = ultimoNivelDAC;
+  gptimer_start(audioTimer);
 
   t0 = millis();
   while (audioReproduciendo && millis() - t0 < timeoutMs) {
